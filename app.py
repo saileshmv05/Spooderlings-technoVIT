@@ -1278,7 +1278,7 @@ def session_count() -> int:
 # 11b. GEMINI AI CONSULTANT + CONTRADICTION (devil's advocate)
 # =============================================================================
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = 'gemini-3.6-flash'
 
 
 def gemini_available() -> bool:
