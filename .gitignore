@@ -1,0 +1,5 @@
+sessions.db
+session_logs/
+__pycache__/
+.venv/
+venv/
