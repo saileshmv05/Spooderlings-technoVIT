@@ -1279,7 +1279,7 @@ def session_count() -> int:
 # =============================================================================
 
 # Model candidates, tried in order — the first one the account can serve wins.
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 GEMINI_FALLBACK_MODELS = ("gemini-2.5-pro",)
 
 
