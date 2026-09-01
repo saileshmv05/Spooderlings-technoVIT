@@ -1283,6 +1283,41 @@ GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_FALLBACK_MODELS = ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest")
 
 
+def secret_gemini_key() -> str:
+    """Read the Gemini key from Streamlit secrets, then the environment.
+
+    Supports every layout people actually use in `.streamlit/secrets.toml`:
+        GEMINI_API_KEY = "..."        /  gemini_api_key = "..."
+        [gemini]                      /  [google]
+        api_key = "..."                  GEMINI_API_KEY = "..."
+    `st.secrets` raises when no secrets file exists, so every access is guarded.
+    """
+    flat = ("GEMINI_API_KEY", "gemini_api_key", "GOOGLE_API_KEY", "google_api_key")
+    for name in flat:
+        try:
+            val = st.secrets[name]
+        except Exception:
+            continue
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    for section in ("gemini", "google", "api", "general", "default"):
+        try:
+            block = st.secrets[section]
+        except Exception:
+            continue
+        if not hasattr(block, "get"):
+            continue
+        for name in (*flat, "key", "api_key", "API_KEY"):
+            val = block.get(name)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    for name in flat:
+        val = os.environ.get(name, "")
+        if val.strip():
+            return val.strip()
+    return ""
+
+
 def gemini_available() -> bool:
     """True when either Gemini SDK (new `google-genai` or legacy) is importable."""
     try:
@@ -1778,9 +1813,19 @@ def render_sidebar() -> dict:
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("#### 🤖 AI Consultant (Gemini)")
-    gemini_key = st.sidebar.text_input("Gemini API key", type="password",
-                                       value=os.environ.get("GEMINI_API_KEY", ""),
-                                       help="Optional — enables the AI consultant chat.")
+    preset_key = secret_gemini_key()
+    if preset_key:
+        st.sidebar.success(f"Gemini key loaded from secrets ✓ (…{preset_key[-4:]})")
+        gemini_key = preset_key
+        if st.sidebar.toggle("Override key manually", value=False, key="gemini_override"):
+            typed = st.sidebar.text_input("Gemini API key", type="password",
+                                          help="Overrides the key from secrets for this session.")
+            gemini_key = typed.strip() or preset_key
+    else:
+        gemini_key = st.sidebar.text_input(
+            "Gemini API key", type="password",
+            help="Optional — enables the AI consultant chat. Can also come from "
+                 "`.streamlit/secrets.toml` or the GEMINI_API_KEY env var.").strip()
 
     if st.sidebar.button("🔄 Refresh now", width="stretch"):
         ttl_clear()
@@ -2020,12 +2065,13 @@ def main() -> None:
         # --- AI Consultant (Gemini) ---
         st.markdown("---")
         st.markdown("### 🤖 AI Consultant")
-        gkey = (cfg.get("gemini_key") or os.environ.get("GEMINI_API_KEY", "")).strip()
+        gkey = (cfg.get("gemini_key") or secret_gemini_key()).strip()
         if "chat" not in st.session_state:
             st.session_state["chat"] = []
         if not gkey:
-            st.info("Optional: add a **Gemini API key** in the sidebar (or set the `GEMINI_API_KEY` "
-                    "environment variable) to chat with the AI consultant. The rest of the app works without it.")
+            st.info("Optional: add a **Gemini API key** — sidebar box, "
+                    "`.streamlit/secrets.toml` (`GEMINI_API_KEY = \"...\"`), or the "
+                    "`GEMINI_API_KEY` environment variable. The rest of the app works without it.")
         elif not gemini_available():
             st.warning("No Gemini SDK found. Run `pip install google-generativeai` "
                        "(or `pip install google-genai`) and restart the app.")
