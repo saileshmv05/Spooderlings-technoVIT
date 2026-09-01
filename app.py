@@ -1278,10 +1278,18 @@ def session_count() -> int:
 # 11b. GEMINI AI CONSULTANT + CONTRADICTION (devil's advocate)
 # =============================================================================
 
-GEMINI_MODEL = 'gemini-3.6-flash'
+# Model candidates, tried in order — the first one the account can serve wins.
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_FALLBACK_MODELS = ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest")
 
 
 def gemini_available() -> bool:
+    """True when either Gemini SDK (new `google-genai` or legacy) is importable."""
+    try:
+        import google.genai  # noqa: F401
+        return True
+    except Exception:
+        pass
     try:
         import google.generativeai  # noqa: F401
         return True
@@ -1289,14 +1297,81 @@ def gemini_available() -> bool:
         return False
 
 
-def gemini_consult(api_key: str, prompt: str, model: str = GEMINI_MODEL) -> str:
-    import google.generativeai as genai
+def _gemini_text(resp) -> str:
+    """Pull text out of a Gemini response without ever raising.
+
+    `resp.text` raises (instead of returning None) when the model returns no
+    usable candidate — e.g. a safety block or a MAX_TOKENS stop. Falling back to
+    the raw candidate parts keeps the chat from silently dying.
+    """
+    try:
+        txt = resp.text
+        if txt:
+            return txt.strip()
+    except Exception:
+        pass
+    chunks: List[str] = []
+    for cand in (getattr(resp, "candidates", None) or []):
+        content = getattr(cand, "content", None)
+        for part in (getattr(content, "parts", None) or []):
+            piece = getattr(part, "text", None)
+            if piece:
+                chunks.append(piece)
+    if chunks:
+        return "\n".join(chunks).strip()
+
+    # No text at all — explain WHY instead of returning an empty bubble.
+    reason = ""
+    fb = getattr(resp, "prompt_feedback", None)
+    if getattr(fb, "block_reason", None):
+        reason = f" (prompt blocked: {fb.block_reason})"
+    else:
+        cands = getattr(resp, "candidates", None) or []
+        if cands and getattr(cands[0], "finish_reason", None):
+            reason = f" (finish reason: {cands[0].finish_reason})"
+    raise RuntimeError(f"Gemini returned an empty response{reason}.")
+
+
+def _gemini_call_once(api_key: str, prompt: str, model: str) -> str:
+    """One request against whichever SDK is installed."""
+    try:                                    # new SDK: google-genai
+        from google import genai as _genai_new
+        client = _genai_new.Client(api_key=api_key)
+        return _gemini_text(client.models.generate_content(model=model, contents=prompt))
+    except ImportError:
+        pass
+    import google.generativeai as genai     # legacy SDK: google-generativeai
     genai.configure(api_key=api_key)
-    resp = genai.GenerativeModel(model).generate_content(prompt)
-    return (resp.text or "").strip()
+    return _gemini_text(genai.GenerativeModel(model).generate_content(prompt))
 
 
-def build_consult_prompt(result: dict, cfg: dict, question: str) -> str:
+def gemini_consult(api_key: str, prompt: str, model: str = GEMINI_MODEL) -> str:
+    """Ask Gemini, walking the model fallback list on 404/unsupported errors."""
+    if not (api_key or "").strip():
+        raise RuntimeError("No Gemini API key provided.")
+    errors: List[str] = []
+    tried: List[str] = []
+    for name in (model, *GEMINI_FALLBACK_MODELS):
+        if name in tried:
+            continue
+        tried.append(name)
+        try:
+            return _gemini_call_once(api_key.strip(), prompt, name)
+        except Exception as exc:                            # noqa: BLE001
+            msg = str(exc)
+            errors.append(f"{name}: {msg}")
+            low = msg.lower()
+            # Bad key / quota / network — retrying other models won't help.
+            if any(t in low for t in ("api key", "api_key", "permission", "unauthenticated",
+                                      "quota", "exhausted", "invalid_argument")):
+                break
+            # 404 / unsupported model → try the next candidate.
+            continue
+    raise RuntimeError(" | ".join(errors) or "Gemini call failed.")
+
+
+def build_consult_prompt(result: dict, cfg: dict, question: str,
+                         history: Optional[List[dict]] = None) -> str:
     committee = result["committee"]
     payload = result["payload"]
     ind = payload["indicators"]
@@ -1312,12 +1387,18 @@ def build_consult_prompt(result: dict, cfg: dict, question: str) -> str:
     for a in result["agents"]:
         lines.append(f"- {a['role']} ({a['signal']}, confidence {a['confidence']:.2f}): {a['summary']}")
     context = "\n".join(lines)
+    convo = ""
+    if history:
+        turns = [f"{'User' if m['role'] == 'user' else 'StockDNA'}: {m['content']}"
+                 for m in history[-6:] if m.get("content")]
+        if turns:
+            convo = "CONVERSATION SO FAR:\n" + "\n".join(turns) + "\n\n"
     return (
         "You are StockDNA, a financial-intelligence consultant for retail investors in India. "
         "Answer the user's question using the analysis context below. Be concise, honest and clear. "
         "Use ₹ and Indian market terms where relevant. End with a one-line disclaimer that this is "
         "educational information, not personalised investment advice.\n\n"
-        f"ANALYSIS CONTEXT:\n{context}\n\nUSER QUESTION: {question}\n\nANSWER:"
+        f"ANALYSIS CONTEXT:\n{context}\n\n{convo}USER QUESTION: {question}\n\nANSWER:"
     )
 
 
@@ -1648,6 +1729,17 @@ def cached_macro(macro_down: bool):
                    lambda: get_macro(macro_down))
 
 
+CHAT_QUIET_SECONDS = 90     # pause the live auto-refresh this long after chat activity
+
+
+def chat_is_busy() -> bool:
+    """True while a Gemini answer is pending or the user was just chatting."""
+    if st.session_state.get("chat_pending"):
+        return True
+    last = st.session_state.get("chat_last_activity", 0.0)
+    return (time.time() - last) < CHAT_QUIET_SECONDS
+
+
 def render_sidebar() -> dict:
     st.sidebar.markdown("## StockDNA")
     st.sidebar.caption("Multi-Agent Financial Intelligence · PS-01")
@@ -1721,7 +1813,11 @@ def main() -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
 
     cfg = render_sidebar()
-    if cfg["live_on"] and cfg["interval"]:
+    # Auto-refresh reruns the whole script on a timer. A rerun that lands while
+    # the Gemini call is in flight kills the script mid-request, so the user's
+    # question stays on screen with no answer ever appended. Hold the timer off
+    # while a chat request is pending / the user is mid-conversation.
+    if cfg["live_on"] and cfg["interval"] and not chat_is_busy():
         st_autorefresh(interval=cfg["interval"] * 1000, key="stockdna_live")
 
     st.markdown("## StockDNA — Multi-Agent Investment Intelligence")
@@ -1924,30 +2020,56 @@ def main() -> None:
         # --- AI Consultant (Gemini) ---
         st.markdown("---")
         st.markdown("### 🤖 AI Consultant")
-        gkey = cfg.get("gemini_key") or os.environ.get("GEMINI_API_KEY", "")
+        gkey = (cfg.get("gemini_key") or os.environ.get("GEMINI_API_KEY", "")).strip()
         if "chat" not in st.session_state:
             st.session_state["chat"] = []
         if not gkey:
             st.info("Optional: add a **Gemini API key** in the sidebar (or set the `GEMINI_API_KEY` "
                     "environment variable) to chat with the AI consultant. The rest of the app works without it.")
         elif not gemini_available():
-            st.warning("The `google-generativeai` package is not installed. Run `pip install google-generativeai`.")
+            st.warning("No Gemini SDK found. Run `pip install google-generativeai` "
+                       "(or `pip install google-genai`) and restart the app.")
         else:
             for msg in st.session_state["chat"]:
                 with st.chat_message(msg["role"]):
                     st.markdown(msg["content"])
+
+            pending = st.session_state.get("chat_pending")
+
+            # Two-phase answer: the question is stored + rendered on one run, then
+            # answered on the next. The answering run has auto-refresh disabled
+            # (see chat_is_busy), so a timer rerun can no longer abort the call.
+            if pending:
+                with st.chat_message("assistant"):
+                    with st.spinner("Consulting Gemini…"):
+                        try:
+                            ans = gemini_consult(
+                                gkey,
+                                build_consult_prompt(result, cfg, pending,
+                                                     st.session_state["chat"][:-1]),
+                            )
+                            if not ans:
+                                ans = "⚠️ Gemini returned an empty answer. Try rephrasing the question."
+                        except Exception as _e:                     # noqa: BLE001
+                            ans = f"⚠️ Gemini error: {_e}"
+                st.session_state["chat"].append({"role": "assistant", "content": ans})
+                st.session_state["chat_pending"] = None
+                st.session_state["chat_last_activity"] = time.time()
+                st.rerun()
+
             q = st.chat_input("Ask about this stock, the verdict, risks, or next steps…")
             if q:
                 st.session_state["chat"].append({"role": "user", "content": q})
-                with st.spinner("Consulting Gemini…"):
-                    try:
-                        ans = gemini_consult(gkey, build_consult_prompt(result, cfg, q))
-                        st.session_state["chat"].append({"role": "assistant", "content": ans})
-                    except Exception as _e:
-                        st.session_state["chat"].append({"role": "assistant", "content": f"⚠️ Gemini error: {_e}"})
+                st.session_state["chat_pending"] = q
+                st.session_state["chat_last_activity"] = time.time()
                 st.rerun()
+
+            if cfg["live_on"] and chat_is_busy():
+                st.caption("⏸️ Live auto-refresh is paused while you chat "
+                           "(it resumes ~90s after your last message).")
             if st.session_state["chat"] and st.button("Clear chat", width="stretch"):
                 st.session_state["chat"] = []
+                st.session_state["chat_pending"] = None
                 st.rerun()
 
     # ================= SCREENER TAB =================

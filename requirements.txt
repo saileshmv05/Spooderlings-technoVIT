@@ -6,4 +6,4 @@ numpy
 plotly
 feedparser
 crewai
-google-generativeai
+google-generativeai>=0.8.0
